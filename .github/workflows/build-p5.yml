@@ -1,0 +1,65 @@
+name: Build Cudy P5 firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p5-firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install OpenWrt build dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+            gettext git glibc-source libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync swig unzip zlib1g-dev
+          df -h /
+
+      - name: Configure both P5 profiles
+        run: .github/ci/p5/prepare.sh
+
+      - name: Build firmware
+        run: make -j"$(nproc)"
+
+      - name: Collect images and checksums
+        working-directory: bin/targets/qualcommax/ipq50xx
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/p5-artifacts"
+          for profile in cudy_p5 cudy_p5-ubootmod; do
+            for suffix in squashfs-sysupgrade.bin squashfs-factory.ubi initramfs-uImage.itb; do
+              image="openwrt-qualcommax-ipq50xx-$profile-$suffix"
+              test -s "$image"
+              cp "$image" "$RUNNER_TEMP/p5-artifacts/"
+            done
+            manifest="openwrt-qualcommax-ipq50xx-$profile.manifest"
+            test -s "$manifest"
+            for package in wwand luci-mod-dashboard luci-theme-shadcn; do
+              grep -q "^$package - " "$manifest"
+            done
+            cp "$manifest" "$RUNNER_TEMP/p5-artifacts/"
+          done
+          cp config.buildinfo feeds.buildinfo version.buildinfo "$RUNNER_TEMP/p5-artifacts/"
+          cd "$RUNNER_TEMP/p5-artifacts"
+          sha256sum ./* > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cudy-p5-firmware
+          path: ${{ runner.temp }}/p5-artifacts/
+          if-no-files-found: error

@@ -36,3 +36,6 @@ git-src
 .ccache
 .sccache
 .vscode*
+
+# Theme checkout created by the P5 build preparation script.
+/package/luci-theme-shadcn/
