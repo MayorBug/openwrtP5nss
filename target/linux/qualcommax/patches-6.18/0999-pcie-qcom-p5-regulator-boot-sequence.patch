@@ -1,0 +1,178 @@
+From: Georg Seema <georgseema@gmail.com>
+Subject: [PATCH] regulator: sequence Cudy P5 modem power before PCIe initialization
+
+Add optional endpoint supply handling to the Qualcomm 2.9.0 host. Enable
+it with PERST# asserted, before PHY initialization and link training.
+Provider deferral prevents the host from probing before power is ready.
+
+Use a P5 fixed-regulator variant to preserve the one-second restart
+power-off on restart, including panic restart. Keep the modem supply
+disabled until the PCIe host requests it.
+
+Signed-off-by: Georg Seema <georgseema@gmail.com>
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -219,6 +219,7 @@
+ };
+
+ struct qcom_pcie_resources_2_9_0 {
++	struct regulator *vddpe_3v3;
+ 	struct clk_bulk_data *clks;
+ 	int num_clks;
+ 	struct reset_control *rst;
+@@ -1143,6 +1144,14 @@
+ 	struct dw_pcie *pci = pcie->pci;
+ 	struct device *dev = pci->dev;
+
++	/* A missing supply is optional; an unresolved provider must defer. */
++	if (of_property_present(dev->of_node, "vddpe-3v3-supply")) {
++		res->vddpe_3v3 = devm_regulator_get(dev, "vddpe-3v3");
++		if (IS_ERR(res->vddpe_3v3))
++			return dev_err_probe(dev, PTR_ERR(res->vddpe_3v3),
++					     "Failed to get endpoint power supply\n");
++	}
++
+ 	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
+ 	if (res->num_clks < 0) {
+ 		dev_err(dev, "Failed to get clocks\n");
+@@ -1161,6 +1170,8 @@
+ 	struct qcom_pcie_resources_2_9_0 *res = &pcie->res.v2_9_0;
+
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++	if (res->vddpe_3v3)
++		regulator_disable(res->vddpe_3v3);
+ }
+
+ static int qcom_pcie_init_2_9_0(struct qcom_pcie *pcie)
+@@ -1189,7 +1200,23 @@
+
+ 	usleep_range(2000, 2500);
+
+-	return clk_bulk_prepare_enable(res->num_clks, res->clks);
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret)
++		return ret;
++
++	/* PERST# remains asserted until qcom_pcie_host_init() finishes. */
++	if (res->vddpe_3v3) {
++		dev_info(dev, "enabling endpoint power before PCIe link training\n");
++		ret = regulator_enable(res->vddpe_3v3);
++		if (ret) {
++			clk_bulk_disable_unprepare(res->num_clks, res->clks);
++			return dev_err_probe(dev, ret,
++					     "Failed to enable endpoint power\n");
++		}
++		dev_info(dev, "endpoint power enabled; continuing PCIe initialization\n");
++	}
++
++	return 0;
+ }
+
+ static int qcom_pcie_post_init_2_9_0(struct qcom_pcie *pcie)
+--- a/drivers/regulator/fixed.c
++++ b/drivers/regulator/fixed.c
+@@ -17,6 +17,7 @@
+ #include <linux/err.h>
+ #include <linux/mutex.h>
+ #include <linux/module.h>
++#include <linux/delay.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_opp.h>
+@@ -43,6 +44,7 @@
+ };
+
+ struct fixed_dev_type {
++	bool power_off_on_restart;
+ 	bool has_enable_clock;
+ 	bool has_performance_state;
+ };
+@@ -218,6 +220,18 @@
+ 	.disable = reg_domain_disable,
+ 	.is_enabled = reg_is_enabled,
+ };
++
++/* P5 modem power must be cut before PSCI resets the SoC, including panic. */
++static int reg_fixed_p5_restart(struct sys_off_data *data)
++{
++	struct gpio_desc *enable = data->cb_data;
++
++	/* The P5 uses a non-sleeping TLMM GPIO; logical low disables power. */
++	gpiod_set_value(enable, 0);
++	mdelay(1000);
++
++	return NOTIFY_DONE;
++}
+
+ static int reg_fixed_voltage_probe(struct platform_device *pdev)
+ {
+@@ -335,6 +349,22 @@
+ 				     "Failed to register regulator: %ld\n",
+ 				     PTR_ERR(drvdata->dev));
+
++	if (drvtype && drvtype->power_off_on_restart) {
++		if (!cfg.ena_gpiod || gpiod_cansleep(cfg.ena_gpiod))
++			return dev_err_probe(dev, -EINVAL,
++					     "Modem restart requires a non-sleeping enable GPIO\n");
++
++		ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_RESTART,
++						    SYS_OFF_PRIO_HIGH,
++						    reg_fixed_p5_restart, cfg.ena_gpiod);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "Failed to register modem restart handler\n");
++
++		dev_info(dev, "P5 modem power initially off; minimum off time %u us\n",
++			 config->off_on_delay);
++	}
++
+ 	platform_set_drvdata(pdev, drvdata);
+
+ 	dev_dbg(&pdev->dev, "%s supplying %duV\n", drvdata->desc.name,
+@@ -348,6 +378,10 @@
+ }
+
+ #if defined(CONFIG_OF)
++static const struct fixed_dev_type fixed_p5_modem_data = {
++	.power_off_on_restart = true,
++};
++
+ static const struct fixed_dev_type fixed_voltage_data = {
+ 	.has_enable_clock = false,
+ };
+@@ -361,6 +395,10 @@
+ };
+
+ static const struct of_device_id fixed_of_match[] = {
++	{
++		.compatible = "cudy,p5-modem-power",
++		.data = &fixed_p5_modem_data,
++	},
+ 	{
+ 		.compatible = "regulator-fixed",
+ 		.data = &fixed_voltage_data,
+--- a/Documentation/devicetree/bindings/regulator/fixed-regulator.yaml
++++ b/Documentation/devicetree/bindings/regulator/fixed-regulator.yaml
+@@ -49,10 +49,18 @@
+         deprecated: true
+
+   compatible:
+-    enum:
+-      - regulator-fixed
+-      - regulator-fixed-clock
+-      - regulator-fixed-domain
++    oneOf:
++      - enum:
++          - regulator-fixed
++          - regulator-fixed-clock
++          - regulator-fixed-domain
++      - items:
++          - const: cudy,p5-modem-power
++          - const: regulator-fixed
++        description: |
++          Cudy P5 modem power switch. Starts disabled and cuts modem power
++          for one second from the restart handler before the SoC resets.
++          The enable GPIO must support non-sleeping access.
+
+   regulator-name: true
+

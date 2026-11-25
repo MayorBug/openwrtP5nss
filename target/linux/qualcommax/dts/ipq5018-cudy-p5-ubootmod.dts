@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+#include "ipq5018-cudy-p5.dts"
+
+/ {
+	model = "Cudy P5 (U-Boot mod)";
+	compatible = "cudy,p5-ubootmod", "cudy,p5", "qcom,ipq5018";
+
+	/* Custom U-Boot leaves power off until the PCIe host requests it. */
+	modem_power: regulator-modem-power {
+		compatible = "cudy,p5-modem-power", "regulator-fixed";
+		regulator-name = "modem-power";
+		gpio = <&tlmm 35 GPIO_ACTIVE_LOW>;
+	};
+
+	gpio-export {
+		/delete-node/ modem-power;
+	};
+};
+
+&qpic_nand {
+	nand@0 {
+		partitions {
+			partition@7c0000 {
+				reg = <0x07c0000 0x4800000>;
+			};
+
+			/delete-node/ partition@2bc0000;
+		};
+	};
+};
+
+&pcie1 {
+	vddpe-3v3-supply = <&modem_power>;
+};
