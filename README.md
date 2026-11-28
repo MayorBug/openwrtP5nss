@@ -17,6 +17,10 @@ I'll not take responsibility for bricked routers!
 AI usage notice, without it this project would not be possible by me. 
 The rest is slop
 
+## Screenshots
+
+![LuCI dashboard, NSS offload status, and modem signal charts](docs/screenshots/p5-nss.gif)
+
 ## Choose an image
 
 Choose the image that matches your router’s flash layout.
